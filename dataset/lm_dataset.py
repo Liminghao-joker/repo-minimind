@@ -6,6 +6,7 @@ from datasets import load_dataset
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def pre_processing_chat(conversations, add_system_ratio=0.2):
+    """以 20% 的概率为没有 system prompt 的对话随机添加一个 """
     SYSTEM_PROMPTS = [
         "你是一个知识丰富的AI，尽力为用户提供准确的信息。",
         "你是minimind，一个小巧但有用的语言模型。",
@@ -24,15 +25,18 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
     return conversations
 
 def post_processing_chat(prompt_content, empty_think_ratio=0.05):
+    """以 5% 的概率删除 <think>\n\n</think>\n\n 标签"""
     if '<think>\n\n</think>\n\n' in prompt_content and random.random() > empty_think_ratio:
         prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
     return prompt_content
 
 class PretrainDataset(Dataset):
+    """Pretrain 阶段数据的预处理"""
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # 加载 json 数据，即 text 字段
         self.samples = load_dataset('json', data_files=data_path, split='train')
 
     def __len__(self):
@@ -40,21 +44,29 @@ class PretrainDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
+        tokens = self.tokenizer(str(sample['text']), 
+                                add_special_tokens=False, # 不自动添加特殊 token
+                                max_length=self.max_length - 2, # 截断到 max_length - 2,预留位置给 bos 和 eos
+                                truncation=True
+                            ).input_ids
+        # 手动添加 BOS 和 EOS token
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        # 右侧 padding 到 max_length
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()
-        labels[input_ids == self.tokenizer.pad_token_id] = -100
+        labels[input_ids == self.tokenizer.pad_token_id] = -100 # padding 位置设为 -100，不计算 loss
         return input_ids, labels
 
 
 class SFTDataset(Dataset):
+    """SFT 截断数据预处理，生成 input_ids 和 labels"""
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset('json', data_files=jsonl_path, split='train')
+        # 生成 bos_id 和 eos_id 的 token 编码
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
 
@@ -62,26 +74,32 @@ class SFTDataset(Dataset):
         return len(self.samples)
 
     def create_chat_prompt(self, conversations):
+        """渲染对话模板"""
         messages = conversations.copy()
+        # 检查是否存在 tool 工具调用
         tools = conversations[0]["functions"] if (conversations and conversations[0]["role"] == "system" and conversations[0].get("functions")) else None
         return self.tokenizer.apply_chat_template(
             messages,
-            tokenize=False,
+            tokenize=False, # 返回字符串而非 token ids
             add_generation_prompt=False,
             tools=tools
         )
 
     def generate_labels(self, input_ids):
+        """Loss mask 的生成"""
         labels = [-100] * len(input_ids)
         i = 0
         while i < len(input_ids):
+            # 找到 <|im_start|>assistant\n 的位置
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id)
+                start = i + len(self.bos_id) # assistant 起始位置
                 end = start
+                # 找到对应的 <|im_end|>\n 
                 while end < len(input_ids):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
+                 # 只有 assistant 部分的 label 设为真实 token id（参与 loss）
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     labels[j] = input_ids[j]
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
@@ -91,12 +109,12 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        conversations = pre_processing_chat(sample['conversations'])
-        prompt = self.create_chat_prompt(conversations)
-        prompt = post_processing_chat(prompt)
-        input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
-        labels = self.generate_labels(input_ids)
+        conversations = pre_processing_chat(sample['conversations']) # 数据增强
+        prompt = self.create_chat_prompt(conversations) # 渲染 chat template
+        prompt = post_processing_chat(prompt) # 处理 think 标签
+        input_ids = self.tokenizer(prompt).input_ids[:self.max_length] # tokenize + truncate
+        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids)) # padding
+        labels = self.generate_labels(input_ids) # 生成 loss mask
         # # === 调试打印 ===
         # print(f"\n--- Sample {index} ---")
         # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):

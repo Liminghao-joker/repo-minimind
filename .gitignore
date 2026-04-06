@@ -1,4 +1,6 @@
-model/__pycache__
+__pycache__/
+*.pyc
 out
 website/
 docs-minimind/
+.codex

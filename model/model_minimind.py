@@ -132,7 +132,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
 
-    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim)) # 广播机制，匹配多头
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
 
@@ -148,6 +148,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
+    """GQA attention implementation with RoPE and optional Flash Attention."""
     def __init__(self, args: MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
@@ -172,30 +173,37 @@ class Attention(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
-        bsz, seq_len, _ = x.shape
+        bsz, seq_len, _ = x.shape # [B, T, H]
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim) # [B, T, num_attention_heads, head_dim]
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim) # [B, T, num_key_value_heads, head_dim]
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim) # [B, T, num_key_value_heads, head_dim]
+        
+        #* RoPE position embedding
+        # 应用在 query 和 key 计算注意力前
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
         # kv_cache实现
+        # 应用在 key 和 value 计算注意力前
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
+        """
+        xq: [B, T, num_attention_heads, head_dim] -> [B, num_attention_heads, T, head_dim]
+        xk, xv: [B, T, num_key_value_heads, head_dim] -> [B, num_attention_heads, T, head_dim]
+        """
         xq, xk, xv = (
             xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2), # repeat key and value to match the number of attention heads
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
-
+        # Flash Attention
         if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
-        else:
+        else: # 传统 Attention
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
 
@@ -363,13 +371,14 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        residual = hidden_states
+        """"norm -> self_attn -> residual -> norm -> mlp -> residual"""
+        residual = hidden_states # record input hidden_states 
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
-        hidden_states += residual
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states += residual # residual connection
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states)) # residual connection and ffn
         return hidden_states, present_key_value
 
 
@@ -380,15 +389,17 @@ class MiniMindModel(nn.Module):
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)]) # 初始化层
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
+        
+        # 缓存 RoPE
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, rope_base=config.rope_theta,
                                                     rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
+    #* MiniMindModel forward
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
@@ -396,18 +407,26 @@ class MiniMindModel(nn.Module):
                 use_cache: bool = False,
                 **kwargs):
         batch_size, seq_length = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
+        if hasattr(past_key_values, 'layers'): past_key_values = None # kv_cache
         past_key_values = past_key_values or [None] * len(self.layers)
+        # 若有 cache，说明是推理阶段，此时当前位置从 cache 长度继续往后接
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        # input_ids -> token_embeddings -> hidden_states
+        # [B, T] -> [B, T, H]
+        hidden_states = self.dropout(self.embed_tokens(input_ids)) # embed_tokens
 
+        # 从 cache 的位置开始往后 RoPE 位置编码
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_length],
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
 
-        presents = []
+        #* Block forward
+
+        # 实现的功能： 将前一层 block 的输出 hidden_states 作为 下一层 block 的输入，并且记录每一层的 present_key_value 供推理时使用
+        presents = [] # 记录每一层的 present_key_value，推理时使用
+        # Attention Block × N
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
             hidden_states, present = layer(
                 hidden_states,
@@ -416,7 +435,7 @@ class MiniMindModel(nn.Module):
                 use_cache=use_cache,
                 attention_mask=attention_mask
             )
-            presents.append(present)
+            presents.append(present) # append 到列表里
 
         hidden_states = self.norm(hidden_states)
 
@@ -425,12 +444,16 @@ class MiniMindModel(nn.Module):
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    """
+    语言建模头，包含一个线性层，将 MiniMindModel 的输出 hidden_states 映射到 vocab_size 以得到 logits
+    hidden_states -> lm_head -> logits
+    """
     config_class = MiniMindConfig
 
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
-        self.model = MiniMindModel(self.config)
+        self.model = MiniMindModel(self.config) # 实例化
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
 
@@ -442,21 +465,34 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
+        """
+        input_ids: batch_size x seq_len
+        attention_mask: 标记哪些位置 padding，不参与注意力计算
+        labels: 训练时计算 next_token prediction loss
+        past_key_values: 训练时 kv-cache
+        use_cache: 是否返回 present_key_values 以供推理时使用
+        logits_to_keep:
+        """
         hidden_states, past_key_values, aux_loss = self.model(
-            input_ids=input_ids,
+            input_ids=input_ids, # 输入的token ids
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             **args
         )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(hidden_states[:, slice_indices, :]) #* 映射到 vocab_size 得到 logits
 
+        # 若 labels 不为 None，则计算交叉熵损失
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+            # end of train step
+            # next token prediction: 用位置 i 预测位置 i+1
+            # logits 去尾
+            shift_logits = logits[..., :-1, :].contiguous() # [B, T-1, vocab_size]
+            # labels 去头
+            shift_labels = labels[..., 1:].contiguous() # [B, T-1]
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100) # padding 位不参与 loss 计算
 
         output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss

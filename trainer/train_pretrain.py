@@ -23,24 +23,26 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        # move to GPU
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+        # lr schedule
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        with autocast_ctx:
-            res = model(input_ids, labels=labels)
-            loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+        with autocast_ctx: # forward 用 bfloat16 跑，省显存   
+            res = model(input_ids, labels=labels) # model 内部计算 loss 时，自动忽略 -100
+            loss = res.loss + res.aux_loss # aux_loss default 0 if not MoE
+            loss = loss / args.accumulation_steps # gradient accumulation
 
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) # 梯度裁剪
 
-            scaler.step(optimizer)
+            scaler.step(optimizer) # 更新参数
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
@@ -125,6 +127,7 @@ if __name__ == "__main__":
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
+    # 创建 Dataset
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
@@ -150,6 +153,7 @@ if __name__ == "__main__":
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        # Dataloader 批量输出
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
