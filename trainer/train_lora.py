@@ -133,16 +133,16 @@ if __name__ == "__main__":
     lora_params = []
     for name, param in model.named_parameters():
         if 'lora' in name:
-            param.requires_grad = True
+            param.requires_grad = True # 可训练
             lora_params.append(param)
         else:
-            param.requires_grad = False
+            param.requires_grad = False # 冻结参数
     
     # ========== 6. 定义数据和优化器 ==========
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
-    optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
+    optimizer = optim.AdamW(lora_params, lr=args.learning_rate) # 只接受 LoRA 参数
     
     # ========== 7. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
