@@ -140,6 +140,8 @@ class DPODataset(Dataset):
         sample = self.samples[index]
         chosen = sample['chosen']  # 是一个 list，里面包含若干 {role, content}
         rejected = sample['rejected']  # 同上
+
+        # chat_template 渲染
         chosen_prompt = self.tokenizer.apply_chat_template(
             chosen, tokenize=False, add_generation_prompt=False
         )
@@ -151,7 +153,7 @@ class DPODataset(Dataset):
         rejected_prompt = post_processing_chat(rejected_prompt)
         chosen_encoding = self.tokenizer(
             chosen_prompt, truncation=True, max_length=self.max_length, padding='max_length'
-        )
+        ) # tokenize + truncate + pad
         rejected_encoding = self.tokenizer(
             rejected_prompt, truncation=True, max_length=self.max_length, padding='max_length'
         )
@@ -161,6 +163,7 @@ class DPODataset(Dataset):
 
         rejected_input_ids = rejected_encoding['input_ids']
         rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
+        # 仍然遵循 causal LM 的 next-token prediction 对齐方式
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)

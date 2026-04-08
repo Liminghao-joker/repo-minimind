@@ -22,36 +22,44 @@ warnings.filterwarnings('ignore')
 
 
 def logits_to_log_probs(logits, labels):
+    """logits 概率计算，返回每个 token 对应的 prob 的 log 值"""
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
     log_probs = F.log_softmax(logits, dim=2)
+    # label.unsqueeze(2) shape:(batch_size, seq_len, 1) 作为 gather 的 index
+    # torch.gather() 在每个位置挑出对应的 label token 的 log_prob
+    # .squeeze(-1) shape: (batch_size, seq_len) 去掉最后的维度
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
     return log_probs_per_token
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
+    """DOP loss"""
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
     # https://github.com/jingyaogong/minimind/issues/298
     seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN
-    ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
-    policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    # 按照长度进行归一化
+    ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze() # (batch_size,)
+    policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze() # (batch_size,)
 
     # 将 chosen 和 rejected 数据分开
     batch_size = ref_log_probs.shape[0]
-    chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
-    reject_ref_log_probs = ref_log_probs[batch_size // 2:]
-    chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
-    reject_policy_log_probs = policy_log_probs[batch_size // 2:]
+    # x = torch.cat([x_chosen, x_rejected], dim=0) 时，前半部分是 chosen，后半部分是 rejected
+    chosen_ref_log_probs = ref_log_probs[:batch_size // 2] # ref 对 chosen 的评分
+    reject_ref_log_probs = ref_log_probs[batch_size // 2:] # ref 对 rejected 的评分
+    chosen_policy_log_probs = policy_log_probs[:batch_size // 2] # policy 对 chosen 的评分
+    reject_policy_log_probs = policy_log_probs[batch_size // 2:] # policy 对 rejected 的评分
 
-    pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
-    ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
-    logits = pi_logratios - ref_logratios
-    loss = -F.logsigmoid(beta * logits)
+    pi_logratios = chosen_policy_log_probs - reject_policy_log_probs # policy 侧，衡量 policy model 认为 choosen 比 rejected 好多少
+    ref_logratios = chosen_ref_log_probs - reject_ref_log_probs # ref 侧，衡量 ref model 认为 choosen 比 rejected 好多少
+    logits = pi_logratios - ref_logratios # policy 相对于 ref 的优势程度
+    loss = -F.logsigmoid(beta * logits) # sigmoid + 取负号
     return loss.mean()
 
 
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
+    """训练主循环"""
     start_time = time.time()
     
     for step, batch in enumerate(loader, start=start_step + 1):
@@ -61,19 +69,21 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
         y_rejected = batch['y_rejected'].to(args.device)
         mask_chosen = batch['mask_chosen'].to(args.device)
         mask_rejected = batch['mask_rejected'].to(args.device)
-        x = torch.cat([x_chosen, x_rejected], dim=0)
+        x = torch.cat([x_chosen, x_rejected], dim=0) # (batch_size*2, seq_len)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
 
+        # 控制较小的学习率
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
         with autocast_ctx:
+            # ref model forward with no grad
             with torch.no_grad():
-                ref_outputs = ref_model(x)
+                ref_outputs = ref_model(x) # (batch_size*2, seq_len, vocab_size)
                 ref_logits = ref_outputs.logits
-            ref_log_probs = logits_to_log_probs(ref_logits, y)
+            ref_log_probs = logits_to_log_probs(ref_logits, y) # (batch_size*2, seq_len)
             
             outputs = model(x)
             logits = outputs.logits
@@ -81,15 +91,15 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             
             dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
             loss = dpo_loss_val + outputs.aux_loss
-            loss = loss / args.accumulation_steps
+            loss = loss / args.accumulation_steps # gradient accumulation
 
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) # 梯度裁剪
+            scaler.step(optimizer) # 更新参数
+            scaler.update() # 更新 scaler状态
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters:
@@ -180,7 +190,7 @@ if __name__ == "__main__":
     # 初始化参考模型（ref_model冻结）
     ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
     ref_model.eval()
-    ref_model.requires_grad_(False)
+    ref_model.requires_grad_(False) # 冻结参考模型的参数
     Logger(f'参考模型总参数量：{sum(p.numel() for p in ref_model.parameters()) / 1e6:.3f} M')
     
     train_ds = DPODataset(args.data_path, tokenizer, max_length=args.max_seq_len)
