@@ -1,5 +1,5 @@
 # debug
-# 数据检查脚本
+# 数据检查脚本,看到每个数据文件打印出前 1–2 条样本。
 import json
 from pathlib import Path
 
@@ -7,8 +7,6 @@ files = [
     "dataset/pretrain_t2t_mini.jsonl",
     "dataset/sft_t2t_mini.jsonl",
     "dataset/dpo.jsonl",
-    "dataset/lora_identity.jsonl",
-    "dataset/lora_medical.jsonl",
 ]
 
 def preview_jsonl(path: Path, n: int = 2):
