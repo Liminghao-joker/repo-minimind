@@ -4,3 +4,15 @@ out
 website/
 docs-minimind/
 .codex
+
+# Minimind local practice artifacts
+dataset/
+out/
+checkpoints/
+minimind-3/
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+logs/*.log
