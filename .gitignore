@@ -16,3 +16,6 @@ minimind-3/
 *.safetensors
 *.ckpt
 logs/*.log
+
+debug/
+trainer/wandb/
