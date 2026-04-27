@@ -26,13 +26,15 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         # move to GPU
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
-        # lr schedule
+        # lr schedule，在每个 step 会手动更新学习率
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        with autocast_ctx: # forward 用 bfloat16 跑，省显存   
+        with autocast_ctx: # forward 用 bfloat16 跑，省显存
+            #* 核心 forward 调用   
             res = model(input_ids, labels=labels) # model 内部计算 loss 时，自动忽略 -100
+            # 添加了 MoE 的辅助 loss
             loss = res.loss + res.aux_loss # aux_loss default 0 if not MoE
             loss = loss / args.accumulation_steps # gradient accumulation
 
@@ -63,11 +65,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
+            # 推理 / 后续训练时的纯模型权重
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp) # 模型保存
+            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+            # resume checkpoint
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
             del state_dict
@@ -76,7 +80,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 
 if __name__ == "__main__":
-    #* 从命令行参数得到训练配置
+    #* 从命令行默认参数得到训练配置
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
@@ -128,14 +132,16 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
+    #* 加载 tokenizer
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
-    # 创建 Dataset
+    #* 创建 Dataset
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    #* Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
@@ -154,6 +160,7 @@ if __name__ == "__main__":
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
+        #* 在每个 epoch 内构造 batch sample 和 dataloader
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
