@@ -4,6 +4,7 @@ out
 website/
 docs-minimind/
 .codex
+CLAUDE.md
 
 # Minimind local practice artifacts
 dataset/
